@@ -1,0 +1,79 @@
+name: Build Windows (Surge direct fix)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64-patched:
+    name: Build Windows x64 (patched minirtc)
+    runs-on: windows-2022
+    env:
+      XMAKE_GLOBALDIR: D:\xmake_global
+    steps:
+      - name: Cache xmake dependencies
+        uses: actions/cache@v4
+        with:
+          path: D:\xmake_global\.xmake\packages
+          key: ${{ runner.os }}-xmake-deps-intel-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-xmake-deps-intel-
+
+      - name: Install xmake
+        run: |
+          Invoke-Expression (Invoke-Webrequest 'https://raw.githubusercontent.com/tboox/xmake/master/scripts/get.ps1' -UseBasicParsing).Content
+          echo "C:\Users\runneradmin\xmake" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          xmake create cuda
+          Set-Location cuda
+          xmake g --theme=plain
+          $cudaPath = ""
+          $packagesPath = "D:\xmake_global\.xmake\packages"
+          if (Test-Path $packagesPath) {
+              try {
+                  $info = xmake require --info "cuda 12.6.3" 2>$null
+                  if ($null -ne $info -and $info -ne "") {
+                      $cudaPath = (($info | Select-String installdir).ToString() -replace '.*installdir:\s*','').Trim()
+                  }
+              } catch {}
+          }
+          if ($cudaPath -eq "") {
+              Write-Host "Installing CUDA package..."
+              xmake require -vy "cuda 12.6.3"
+              $info = xmake require --info "cuda 12.6.3"
+              $cudaPath = (($info | Select-String installdir).ToString() -replace '.*installdir:\s*','').Trim()
+          }
+          echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+          Write-Host "Resolved CUDA_PATH = $cudaPath"
+          Pop-Location
+
+      - name: Checkout code (pinned to the CrossDesk 1.7.7 build commit)
+        uses: actions/checkout@v4
+        with:
+          ref: c3916910653a093588c8a85ca3b6f886720edd49
+          submodules: recursive
+
+      - name: Patch minirtc direct candidate check
+        shell: pwsh
+        run: |
+          $p = "deps/submodules/minirtc/src/ice/direct_ice_policy.h"
+          if (-not (Test-Path $p)) { throw "File not found: $p" }
+          $text = Get-Content $p -Raw
+          $needle = "if (*candidate_address != expected) return std::nullopt;"
+          if (-not $text.Contains($needle)) { throw "Patch target not found in $p - refusing to build unpatched code" }
+          $text = $text.Replace($needle, "/* surge-fix: do not reject candidates whose IP differs from the pinned address; the IP is rewritten to the pinned address below. */")
+          Set-Content $p $text -NoNewline
+          Write-Host "Patched $p"
+          Select-String -Path $p -Pattern "surge-fix|DirectAddressString\(expected\)" | ForEach-Object { "  line $($_.LineNumber): $($_.Line.Trim())" }
+
+      - name: Build CrossDesk
+        run: |
+          xmake f --CROSSDESK_VERSION=v1.7.7-surgefix --USE_CUDA=true -y
+          xmake b -vy crossdesk
+
+      - name: Upload patched exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: crossdesk-win-x64-surgefix
+          path: build/windows/x64/release/crossdesk.exe
